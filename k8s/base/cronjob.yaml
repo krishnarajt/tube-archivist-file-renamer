@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: media-metadata-renamer
+spec:
+  schedule: "0 */6 * * *"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: renamer
+              image: ghcr.io/your-org/tube-archivist-file-renamer:latest
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: INPUT_FOLDER
+                  value: /media/input
+              volumeMounts:
+                - name: media-volume
+                  mountPath: /media/input
+          volumes:
+            - name: media-volume
+              hostPath:
+                path: /mnt/media/input
+                type: Directory
