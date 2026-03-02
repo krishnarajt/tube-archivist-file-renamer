@@ -11,9 +11,9 @@ from typing import Optional
 
 SUPPORTED_MEDIA_EXTENSIONS = {".mp3", ".m4a", ".mp4"}
 SUPPORTED_SUBTITLE_EXTENSIONS = {".vtt"}
-# dotenv
-import dotenv
-dotenv.load_dotenv()
+# # dotenv
+# import dotenv
+# dotenv.load_dotenv()
 
 def sanitize_name(value: str) -> str:
     value = re.sub(r"[\\/:*?\"<>|\x00-\x1F]", "_", value.strip())
