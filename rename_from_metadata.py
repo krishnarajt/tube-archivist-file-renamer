@@ -77,59 +77,102 @@ def extract_id3_metadata(path: Path) -> tuple[Optional[str], Optional[str]]:
 
 
 def parse_atoms(buf: bytes, start: int, end: int):
+    """Yield (atom_start, atom_end, atom_type_bytes, header_size) for each atom in [start, end)."""
     pos = start
     while pos + 8 <= end:
         size = int.from_bytes(buf[pos:pos + 4], "big")
         atype = buf[pos + 4:pos + 8]
+        header = 8
         if size == 0:
+            # Atom extends to end of file
             size = end - pos
         elif size == 1:
+            # Extended 64-bit size
             if pos + 16 > end:
                 return
             size = int.from_bytes(buf[pos + 8:pos + 16], "big")
             header = 16
-        else:
-            header = 8
         if size < header or pos + size > end:
             return
         yield pos, pos + size, atype, header
         pos += size
 
 
+def find_atom(buf: bytes, start: int, end: int, target: bytes):
+    """Find first atom of type `target` within [start, end), return (data_start, data_end) or None."""
+    for s, e, t, h in parse_atoms(buf, start, end):
+        if t == target:
+            return s + h, e
+    return None
+
+
+def find_atom_recursive(buf: bytes, start: int, end: int, *path: bytes):
+    """Walk a chain of atom types, return (data_start, data_end) of the final atom or None."""
+    region = (start, end)
+    for step in path:
+        result = find_atom(buf, *region, step)
+        if result is None:
+            return None
+        region = result
+    return region
+
+
 def extract_mp4_metadata(path: Path) -> tuple[Optional[str], Optional[str]]:
     buf = path.read_bytes()
+    n = len(buf)
 
-    def find_child_region(parent_start, parent_end, child):
-        for s, e, t, h in parse_atoms(buf, parent_start, parent_end):
-            if t == child:
-                return s + h, e
-        return None
-
-    root = (0, len(buf))
-    moov = find_child_region(*root, b"moov")
+    # Find moov
+    moov = find_atom(buf, 0, n, b"moov")
     if not moov:
         return None, None
-    udta = find_child_region(*moov, b"udta") or moov
-    meta = find_child_region(*udta, b"meta")
-    if not meta:
-        return None, None
-    ilst = find_child_region(*meta, b"ilst")
+
+    # ilst can live under moov/udta/meta/ilst OR moov/meta/ilst
+    ilst = None
+    for meta_path in [
+        (b"udta", b"meta"),
+        (b"meta",),
+    ]:
+        meta = find_atom_recursive(buf, *moov, *meta_path)
+        if not meta:
+            continue
+
+        # The 'meta' atom is a FullBox: it has a 4-byte version+flags field
+        # before its children. Try with and without that offset.
+        for meta_offset in (4, 0):
+            meta_start = meta[0] + meta_offset
+            meta_end = meta[1]
+            if meta_start >= meta_end:
+                continue
+            result = find_atom(buf, meta_start, meta_end, b"ilst")
+            if result:
+                ilst = result
+                break
+        if ilst:
+            break
+
     if not ilst:
         return None, None
 
     title = artist = None
+
     for s, e, t, h in parse_atoms(buf, *ilst):
-        key = t
-        for cs, ce, ct, ch in parse_atoms(buf, s + h, e):
-            if ct != b"data":
-                continue
-            payload = buf[cs + ch + 8:ce]
-            text = payload.decode("utf-8", errors="ignore").strip("\x00 ")
-            if key == b"\xa9nam" and text:
-                title = text
-            elif key in (b"\xa9ART", b"aART") and text:
-                artist = text
-    return title, artist
+        # Each item atom contains a 'data' child
+        data_atom = find_atom(buf, s + h, e, b"data")
+        if not data_atom:
+            continue
+        ds, de = data_atom
+        # data atom: 4 bytes type indicator + 4 bytes locale, then UTF-8 text
+        if de - ds < 8:
+            continue
+        text = buf[ds + 8:de].decode("utf-8", errors="ignore").strip("\x00 ")
+        if not text:
+            continue
+        if t == b"\xa9nam":
+            title = text
+        elif t in (b"\xa9ART", b"aART"):
+            artist = text
+
+    return title or None, artist or None
 
 
 def extract_metadata(path: Path) -> tuple[Optional[str], Optional[str]]:
@@ -139,8 +182,8 @@ def extract_metadata(path: Path) -> tuple[Optional[str], Optional[str]]:
             return extract_id3_metadata(path)
         if ext in {".mp4", ".m4a"}:
             return extract_mp4_metadata(path)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[warn] Error reading metadata from {path}: {exc}", file=sys.stderr)
     return None, None
 
 
