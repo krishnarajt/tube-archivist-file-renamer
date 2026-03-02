@@ -11,7 +11,9 @@ from typing import Optional
 
 SUPPORTED_MEDIA_EXTENSIONS = {".mp3", ".m4a", ".mp4"}
 SUPPORTED_SUBTITLE_EXTENSIONS = {".vtt"}
-
+# dotenv
+import dotenv
+dotenv.load_dotenv()
 
 def sanitize_name(value: str) -> str:
     value = re.sub(r"[\\/:*?\"<>|\x00-\x1F]", "_", value.strip())
@@ -195,13 +197,30 @@ def build_subtitle_index(root: Path):
     return out
 
 
-def rename_related_subtitles(old_media: Path, new_media: Path, idx):
-    for sub in idx.get(old_media.with_suffix(""), []):
-        target = unique_path((new_media.parent / new_media.stem).with_suffix(sub.suffix.lower()))
-        print(f"[subtitle] {sub} -> {target}")
-        sub.rename(target)
+def rename_related_files(old_media: Path, new_media: Path):
+    """
+    Rename any file in the same directory that starts with the same
+    stem as the old media file (except the media file itself).
+    """
+    old_stem = old_media.stem
 
+    for sibling in old_media.parent.iterdir():
+        if not sibling.is_file():
+            continue
+        if sibling == old_media:
+            continue
 
+        # Match files that start with old stem
+        if sibling.name.startswith(old_stem):
+            # Preserve everything after the original stem
+            suffix_part = sibling.name[len(old_stem):]
+
+            new_name = new_media.stem + suffix_part
+            target = unique_path(new_media.parent / new_name)
+
+            print(f"[related] {sibling} -> {target}")
+            sibling.rename(target)
+            
 def process(root: Path) -> int:
     subtitle_index = build_subtitle_index(root)
     folder_artists = defaultdict(list)
@@ -216,7 +235,7 @@ def process(root: Path) -> int:
         if target != media:
             print(f"[media] {media} -> {target}")
             media.rename(target)
-            rename_related_subtitles(media, target, subtitle_index)
+            rename_related_files(media, target)
             media = target
         folder_artists[media.parent].append(sanitize_name(artist))
 
