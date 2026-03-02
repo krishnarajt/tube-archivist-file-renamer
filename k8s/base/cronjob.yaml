@@ -17,14 +17,14 @@ spec:
               imagePullPolicy: Always
               env:
                 - name: INPUT_FOLDER
-                  value: /music/podcasts/test
+                  value: /music/podcasts/youtube
               
               volumeMounts:
                 - name: media-volume
-                  mountPath: /music/podcasts/test
+                  mountPath: /music/podcasts/youtube
               
           volumes:
             - name: media-volume
               hostPath:
-                path: /music/podcasts/test
+                path: /music/podcasts/youtube
                 type: Directory
