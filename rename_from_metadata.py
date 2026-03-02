@@ -17,8 +17,8 @@ SUPPORTED_SUBTITLE_EXTENSIONS = {".vtt"}
 TRACKING_FILE_NAME = ".converted_ids.json"
 
 # # dotenv
-import dotenv
-dotenv.load_dotenv()
+# import dotenv
+# dotenv.load_dotenv()
 
 
 # ---------------------------------------------------------------------------
