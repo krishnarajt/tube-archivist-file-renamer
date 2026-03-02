@@ -17,7 +17,7 @@ spec:
               imagePullPolicy: IfNotPresent
               env:
                 - name: INPUT_FOLDER
-                  value: /media/input
+                  value: /music/podcasts/test
               volumeMounts:
                 - name: media-volume
                   mountPath: /media/input
