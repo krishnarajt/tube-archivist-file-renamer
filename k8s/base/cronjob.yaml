@@ -18,13 +18,21 @@ spec:
               env:
                 - name: INPUT_FOLDER
                   value: /music/podcasts/youtube
+                - name: OUTPUT_FOLDER
+                  value: /music/podcasts
               
               volumeMounts:
                 - name: media-volume
                   mountPath: /music/podcasts/youtube
+                - name: output-volume
+                  mountPath: /music/podcasts
               
           volumes:
             - name: media-volume
               hostPath:
                 path: /music/podcasts/youtube
                 type: Directory
+            - name: output-volume
+              hostPath:
+                path: /music/podcasts
+                type: DirectoryOrCreate

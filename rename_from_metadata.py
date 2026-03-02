@@ -1,19 +1,57 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import struct
+import subprocess
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
 SUPPORTED_MEDIA_EXTENSIONS = {".mp3", ".m4a", ".mp4"}
 SUPPORTED_SUBTITLE_EXTENSIONS = {".vtt"}
+
+TRACKING_FILE_NAME = ".converted_ids.json"
+
 # # dotenv
-# import dotenv
-# dotenv.load_dotenv()
+import dotenv
+dotenv.load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Tracking file helpers
+# ---------------------------------------------------------------------------
+
+def file_id(path: Path) -> str:
+    """A stable ID for a file: name + mtime + size."""
+    stat = path.stat()
+    return f"{path.name}|{stat.st_mtime}|{stat.st_size}"
+
+
+def load_tracking(output: Path) -> set[str]:
+    tracking = output / TRACKING_FILE_NAME
+    if tracking.exists():
+        try:
+            return set(json.loads(tracking.read_text()))
+        except Exception:
+            pass
+    return set()
+
+
+def save_tracking(output: Path, ids: set[str]) -> None:
+    tracking = output / TRACKING_FILE_NAME
+    try:
+        tracking.write_text(json.dumps(sorted(ids), indent=2))
+    except Exception as e:
+        print(f"[warn] Could not save tracking file: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Name helpers
+# ---------------------------------------------------------------------------
 
 def sanitize_name(value: str) -> str:
     value = re.sub(r"[\\/:*?\"<>|\x00-\x1F]", "_", value.strip())
@@ -31,6 +69,10 @@ def unique_path(target: Path) -> Path:
             return cand
         i += 1
 
+
+# ---------------------------------------------------------------------------
+# Metadata extraction (read-only)
+# ---------------------------------------------------------------------------
 
 def decode_syncsafe(value: bytes) -> int:
     return ((value[0] & 0x7F) << 21) | ((value[1] & 0x7F) << 14) | ((value[2] & 0x7F) << 7) | (value[3] & 0x7F)
@@ -86,10 +128,8 @@ def parse_atoms(buf: bytes, start: int, end: int):
         atype = buf[pos + 4:pos + 8]
         header = 8
         if size == 0:
-            # Atom extends to end of file
             size = end - pos
         elif size == 1:
-            # Extended 64-bit size
             if pos + 16 > end:
                 return
             size = int.from_bytes(buf[pos + 8:pos + 16], "big")
@@ -101,7 +141,6 @@ def parse_atoms(buf: bytes, start: int, end: int):
 
 
 def find_atom(buf: bytes, start: int, end: int, target: bytes):
-    """Find first atom of type `target` within [start, end), return (data_start, data_end) or None."""
     for s, e, t, h in parse_atoms(buf, start, end):
         if t == target:
             return s + h, e
@@ -109,7 +148,6 @@ def find_atom(buf: bytes, start: int, end: int, target: bytes):
 
 
 def find_atom_recursive(buf: bytes, start: int, end: int, *path: bytes):
-    """Walk a chain of atom types, return (data_start, data_end) of the final atom or None."""
     region = (start, end)
     for step in path:
         result = find_atom(buf, *region, step)
@@ -123,23 +161,15 @@ def extract_mp4_metadata(path: Path) -> tuple[Optional[str], Optional[str]]:
     buf = path.read_bytes()
     n = len(buf)
 
-    # Find moov
     moov = find_atom(buf, 0, n, b"moov")
     if not moov:
         return None, None
 
-    # ilst can live under moov/udta/meta/ilst OR moov/meta/ilst
     ilst = None
-    for meta_path in [
-        (b"udta", b"meta"),
-        (b"meta",),
-    ]:
+    for meta_path in [(b"udta", b"meta"), (b"meta",)]:
         meta = find_atom_recursive(buf, *moov, *meta_path)
         if not meta:
             continue
-
-        # The 'meta' atom is a FullBox: it has a 4-byte version+flags field
-        # before its children. Try with and without that offset.
         for meta_offset in (4, 0):
             meta_start = meta[0] + meta_offset
             meta_end = meta[1]
@@ -158,12 +188,10 @@ def extract_mp4_metadata(path: Path) -> tuple[Optional[str], Optional[str]]:
     title = artist = None
 
     for s, e, t, h in parse_atoms(buf, *ilst):
-        # Each item atom contains a 'data' child
         data_atom = find_atom(buf, s + h, e, b"data")
         if not data_atom:
             continue
         ds, de = data_atom
-        # data atom: 4 bytes type indicator + 4 bytes locale, then UTF-8 text
         if de - ds < 8:
             continue
         text = buf[ds + 8:de].decode("utf-8", errors="ignore").strip("\x00 ")
@@ -189,75 +217,150 @@ def extract_metadata(path: Path) -> tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def build_subtitle_index(root: Path):
-    out = defaultdict(list)
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in SUPPORTED_SUBTITLE_EXTENSIONS:
-            out[p.parent / p.stem].append(p)
-    return out
+# ---------------------------------------------------------------------------
+# ffmpeg helpers
+# ---------------------------------------------------------------------------
+
+def ffmpeg_available() -> bool:
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+        return True
+    except Exception:
+        return False
 
 
-def rename_related_files(old_media: Path, new_media: Path):
-    """
-    Rename any file in the same directory that starts with the same
-    stem as the old media file (except the media file itself).
-    """
-    old_stem = old_media.stem
+def convert_to_mp3(src: Path, dst: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", str(src),
+                "-vn",
+                "-acodec", "libmp3lame",
+                "-q:a", "2",
+                "-map_metadata", "0",
+                "-id3v2_version", "3",
+                str(dst)
+            ],
+            capture_output=True
+        )
+        return result.returncode == 0
+    except Exception as e:
+        print(f"[warn] ffmpeg error converting {src}: {e}", file=sys.stderr)
+        return False
 
-    for sibling in old_media.parent.iterdir():
-        if not sibling.is_file():
-            continue
-        if sibling == old_media:
-            continue
 
-        # Match files that start with old stem
-        if sibling.name.startswith(old_stem):
-            # Preserve everything after the original stem
-            suffix_part = sibling.name[len(old_stem):]
+def copy_with_metadata(src: Path, dst: Path) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", str(src),
+                "-c", "copy",
+                "-map_metadata", "0",
+                "-id3v2_version", "3",
+                str(dst)
+            ],
+            capture_output=True
+        )
+        return result.returncode == 0
+    except Exception as e:
+        print(f"[warn] ffmpeg error copying {src}: {e}", file=sys.stderr)
+        return False
 
-            new_name = new_media.stem + suffix_part
-            target = unique_path(new_media.parent / new_name)
 
-            print(f"[related] {sibling} -> {target}")
-            sibling.rename(target)
-            
-def process(root: Path) -> int:
-    subtitle_index = build_subtitle_index(root)
-    folder_artists = defaultdict(list)
-    media_files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in SUPPORTED_MEDIA_EXTENSIONS]
+# ---------------------------------------------------------------------------
+# Main processing
+# ---------------------------------------------------------------------------
+
+def process(root: Path, output: Path, use_ffmpeg: bool) -> int:
+    converted_ids = load_tracking(output)
+
+    media_files = [
+        p for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED_MEDIA_EXTENSIONS
+    ]
 
     for media in media_files:
+        ext = media.suffix.lower()
+
+        fid = file_id(media)
+        if fid in converted_ids:
+            print(f"[skip] Already converted: {media}")
+            continue
+
         title, artist = extract_metadata(media)
         if not title or not artist:
             print(f"[skip] Missing metadata artist/title: {media}")
             continue
-        target = unique_path(media.with_name(f"{sanitize_name(title)}{media.suffix.lower()}"))
-        if target != media:
-            print(f"[media] {media} -> {target}")
-            media.rename(target)
-            rename_related_files(media, target)
-            media = target
-        folder_artists[media.parent].append(sanitize_name(artist))
 
-    for folder in sorted(folder_artists, key=lambda p: len(p.parts), reverse=True):
-        artist = max(set(folder_artists[folder]), key=folder_artists[folder].count)
-        target_folder = unique_path(folder.with_name(artist))
-        if target_folder != folder:
-            print(f"[folder] {folder} -> {target_folder}")
-            folder.rename(target_folder)
+        safe_title = sanitize_name(title)
+        safe_artist = sanitize_name(artist)
+
+        out_folder = output / safe_artist
+        out_folder.mkdir(exist_ok=True)
+
+        out_media = unique_path(out_folder / f"{safe_title}.mp3")
+
+        if ext == ".mp4":
+            if not use_ffmpeg:
+                print(f"[skip] ffmpeg not available, cannot convert {media}", file=sys.stderr)
+                continue
+            print(f"[convert] {media} -> {out_media}")
+            ok = convert_to_mp3(media, out_media)
+            if not ok:
+                print(f"[error] Conversion failed for {media}", file=sys.stderr)
+                if out_media.exists():
+                    out_media.unlink()
+                continue
+
+        elif ext in {".mp3", ".m4a"}:
+            print(f"[copy] {media} -> {out_media}")
+            ok = copy_with_metadata(media, out_media) if use_ffmpeg else False
+            if not ok:
+                shutil.copy2(media, out_media)
+                print(f"[warn] ffmpeg copy failed or unavailable; used plain copy for {media}", file=sys.stderr)
+
+        else:
+            continue
+
+        # Copy subtitle files to the output folder, renamed to match the output stem
+        old_stem = media.stem
+        for sibling in media.parent.iterdir():
+            if not sibling.is_file():
+                continue
+            if sibling.suffix.lower() not in SUPPORTED_SUBTITLE_EXTENSIONS:
+                continue
+            if sibling.stem == old_stem:
+                new_sub = unique_path(out_folder / f"{safe_title}{sibling.suffix.lower()}")
+                print(f"[subtitle] {sibling} -> {new_sub}")
+                shutil.copy2(sibling, new_sub)
+
+        # Mark as converted only after everything succeeded
+        converted_ids.add(fid)
+        save_tracking(output, converted_ids)
+
     return 0
 
 
 def main() -> int:
     input_folder = os.getenv("INPUT_FOLDER")
-    if not input_folder:
-        print("INPUT_FOLDER env var is required", file=sys.stderr)
+    output_folder = os.getenv("OUTPUT_FOLDER")
+    if not input_folder or not output_folder:
+        print("INPUT_FOLDER and OUTPUT_FOLDER env vars are required", file=sys.stderr)
         return 2
     root = Path(input_folder).expanduser().resolve()
+    output = Path(output_folder).expanduser().resolve()
     if not root.is_dir():
         print(f"INPUT_FOLDER does not exist or is not a dir: {root}", file=sys.stderr)
         return 2
-    return process(root)
+    output.mkdir(parents=True, exist_ok=True)
+
+    use_ffmpeg = ffmpeg_available()
+    if not use_ffmpeg:
+        print("[warn] ffmpeg not found — MP4 conversion and metadata-preserving copy will be skipped.", file=sys.stderr)
+
+    return process(root, output, use_ffmpeg)
 
 
 if __name__ == "__main__":
