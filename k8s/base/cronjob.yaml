@@ -18,11 +18,13 @@ spec:
               env:
                 - name: INPUT_FOLDER
                   value: /music/podcasts/test
+              
               volumeMounts:
                 - name: media-volume
-                  mountPath: /media/input
+                  mountPath: /music/podcasts/test
+              
           volumes:
             - name: media-volume
               hostPath:
-                path: /mnt/media/input
-                type: Directory
+                path: /music/podcasts/test
+                type: Directory/media/input
