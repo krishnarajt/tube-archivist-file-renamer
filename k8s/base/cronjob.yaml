@@ -27,4 +27,4 @@ spec:
             - name: media-volume
               hostPath:
                 path: /music/podcasts/test
-                type: Directory/media/input
+                type: Directory
